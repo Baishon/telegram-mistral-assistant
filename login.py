@@ -1,7 +1,9 @@
 import os
+from getpass import getpass
 from pathlib import Path
 
 from dotenv import load_dotenv
+from telethon.errors import SessionPasswordNeededError
 from telethon import TelegramClient
 
 
@@ -36,11 +38,49 @@ def get_credentials() -> tuple[int, str, str]:
 async def main() -> None:
     api_id, api_hash, session_path = get_credentials()
     client = TelegramClient(session_path, api_id, api_hash)
-    await client.start()
-    me = await client.get_me()
-    print(f"Вход выполнен: {me.first_name or 'аккаунт'}")
-    print(f"Файл сессии: {session_path}.session")
-    await client.disconnect()
+    await client.connect()
+
+    try:
+        if await client.is_user_authorized():
+            me = await client.get_me()
+            print(f"Аккаунт уже авторизован: {me.first_name or 'аккаунт'}")
+            print(f"Файл сессии: {session_path}.session")
+            return
+
+        phone = input("Введите номер телефона в международном формате (+...): ").strip()
+        if not phone:
+            raise RuntimeError("Номер телефона не может быть пустым.")
+
+        sent_code = await client.send_code_request(phone)
+        delivery = type(sent_code.type).__name__
+        delivery_messages = {
+            "SentCodeTypeApp": "код отправлен в Telegram на уже авторизованное устройство",
+            "SentCodeTypeSms": "код отправлен по SMS",
+            "SentCodeTypeCall": "ожидается звонок с кодом",
+            "SentCodeTypeFlashCall": "ожидается автоматический звонок",
+        }
+        print(
+            "Telegram принял запрос на вход: "
+            f"{delivery_messages.get(delivery, delivery)}."
+        )
+        if sent_code.timeout:
+            print(f"Если доставка задерживается, подождите {sent_code.timeout} сек.")
+
+        code = input("Введите код из Telegram: ").strip()
+        if not code:
+            raise RuntimeError("Код подтверждения не может быть пустым.")
+
+        try:
+            await client.sign_in(phone, code, phone_code_hash=sent_code.phone_code_hash)
+        except SessionPasswordNeededError:
+            password = getpass("Введите пароль двухэтапной аутентификации: ")
+            await client.sign_in(password=password)
+
+        me = await client.get_me()
+        print(f"Вход выполнен: {me.first_name or 'аккаунт'}")
+        print(f"Файл сессии: {session_path}.session")
+    finally:
+        await client.disconnect()
 
 
 if __name__ == "__main__":
