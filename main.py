@@ -9,15 +9,12 @@ from httpx import HTTPError
 from mistralai.client import Mistral
 from mistralai.client.errors import MistralError, NoResponseError
 from telegram import (
-    ChosenInlineResult,
     InlineQueryResultArticle,
     InputTextMessageContent,
     Update,
 )
-from telegram.error import TelegramError
 from telegram.ext import (
     Application,
-    ChosenInlineResultHandler,
     ContextTypes,
     InlineQueryHandler,
 )
@@ -27,7 +24,7 @@ ROOT_DIR = Path(__file__).resolve().parent
 load_dotenv(ROOT_DIR / ".env")
 
 MAX_TELEGRAM_MESSAGE_LENGTH = 4096
-THINKING_TEXT = "Обдумываю…"
+MISTRAL_REQUEST_TIMEOUT_SECONDS = 8
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     level=logging.INFO,
@@ -81,44 +78,32 @@ async def handle_inline_query(
         )
         return
 
-    result = make_result(
-        THINKING_TEXT,
-        THINKING_TEXT,
-        f"Нажмите, чтобы отправить запрос: {prompt}",
-    )
-    await inline_query.answer([result], cache_time=0, is_personal=True)
-
-
-async def handle_chosen_inline_result(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    chosen: ChosenInlineResult | None = update.chosen_inline_result
-    if chosen is None or not chosen.query.strip():
-        return
-
-    if not chosen.inline_message_id:
-        logger.error(
-            "Telegram не прислал inline_message_id. Включите inline feedback "
-            "для этого бота через /setinlinefeedback в @BotFather."
-        )
-        return
-
     ai: Mistral = context.application.bot_data["mistral"]
     agent_id: str = context.application.bot_data["agent_id"]
     agent_version: int = context.application.bot_data["agent_version"]
 
     try:
-        response = await asyncio.to_thread(
-            ai.beta.conversations.start,
-            agent_id=agent_id,
-            agent_version=agent_version,
-            inputs=[{"role": "user", "content": chosen.query.strip()}],
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                ai.beta.conversations.start,
+                agent_id=agent_id,
+                agent_version=agent_version,
+                inputs=[{"role": "user", "content": prompt}],
+                timeout_ms=(MISTRAL_REQUEST_TIMEOUT_SECONDS + 2) * 1000,
+            ),
+            timeout=MISTRAL_REQUEST_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.error("Mistral не ответил за %s секунд.", MISTRAL_REQUEST_TIMEOUT_SECONDS)
+        result = make_result(
+            "Нейросеть долго отвечает",
+            "Попробуйте сократить запрос или отправить его ещё раз.",
         )
     except (MistralError, NoResponseError, HTTPError):
         logger.exception("Ошибка при запросе к Mistral")
-        answer = (
-            "Не получилось связаться с нейросетью. "
-            "Проверьте настройки Mistral и попробуйте ещё раз."
+        result = make_result(
+            "Не удалось получить ответ",
+            "Не получилось связаться с нейросетью. Проверьте настройки Mistral и попробуйте ещё раз.",
         )
     else:
         answer = ""
@@ -137,20 +122,19 @@ async def handle_chosen_inline_result(
             if answer.strip():
                 break
 
-        answer = answer.strip() or "Нейросеть вернула пустой ответ."
-        if len(answer) > MAX_TELEGRAM_MESSAGE_LENGTH:
-            answer = answer[: MAX_TELEGRAM_MESSAGE_LENGTH - 1].rstrip() + "…"
+        answer = answer.strip()
+        if not answer:
+            result = make_result(
+                "Нейросеть вернула пустой ответ",
+                "Попробуйте переформулировать запрос.",
+            )
+        else:
+            if len(answer) > MAX_TELEGRAM_MESSAGE_LENGTH:
+                answer = answer[: MAX_TELEGRAM_MESSAGE_LENGTH - 1].rstrip() + "…"
+            result = make_result("Ответ нейросети", answer, answer)
 
-    try:
-        await context.bot.edit_message_text(
-            text=answer,
-            inline_message_id=chosen.inline_message_id,
-        )
-    except TelegramError:
-        logger.exception(
-            "Не удалось отредактировать inline-сообщение. "
-            "Проверьте настройку /setinlinefeedback в @BotFather."
-        )
+    await inline_query.answer([result], cache_time=0, is_personal=True)
+    logger.info("Inline-ответ готов к отправке.")
 
 
 def main() -> None:
@@ -168,13 +152,10 @@ def main() -> None:
     application.bot_data["agent_id"] = required_setting("MISTRAL_AGENT_ID")
     application.bot_data["agent_version"] = agent_version
     application.add_handler(InlineQueryHandler(handle_inline_query))
-    application.add_handler(
-        ChosenInlineResultHandler(handle_chosen_inline_result)
-    )
 
     logger.info(
-        "Inline-бот запущен. Выберите результат «Обдумываю…» в чате, "
-        "чтобы бот заменил его ответом. Остановите Ctrl+C."
+        "Inline-бот запущен. Введите @имя_бота и запрос, затем отправьте "
+        "готовый ответ из результатов. Остановите Ctrl+C."
     )
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
